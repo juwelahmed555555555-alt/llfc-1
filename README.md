@@ -857,6 +857,7 @@ tbody tr.top-3{background:linear-gradient(90deg,rgba(205,127,50,0.07),#060E1C) !
     <div class="modal-title">Edit Player</div>
     <div class="match-form">
       <input type="hidden" id="editPlayerId">
+      <div class="form-group"><label class="form-label">Player Name</label><input class="form-input" id="editPlayerName" placeholder="Player name"></div>
       <div class="form-group"><label class="form-label">Division (1-9)</label><input class="form-input" type="number" min="1" max="9" id="editDivision"></div>
       <div class="form-group"><label class="form-label">Category</label>
         <select class="form-select" id="editCategory">
@@ -1162,6 +1163,64 @@ async function loadHome(){
     }).join(''):'<div class="empty-state"><div class="empty-text">No matches yet</div></div>';
 
     // Division Guide with corrected thresholds
+    // Load season info for display
+    let seasonName='Season', seasonRankHtml='';
+    try{
+      const ss=await getDoc(doc(db,'settings','season'));
+      if(ss.exists()&&ss.data().name) seasonName=ss.data().name;
+
+      // Compute seasonal rank (current season) for logged-in user
+      if(S.user&&ss.exists()&&ss.data().startDate){
+        const seasonStartMs=new Date(ss.data().startDate).getTime();
+        const seasonEndMs=ss.data().endDate?new Date(ss.data().endDate).getTime():Date.now();
+        const playerCatMap={};S.players.forEach(p=>playerCatMap[p.id]=p.category||'Main');
+        const seasonMatches=S.matches.filter(m=>m.status==='confirmed'&&(()=>{const t=m.createdAt?.toDate?.()?.getTime()||0;return t>=seasonStartMs&&t<=seasonEndMs;})());
+
+        const seasonRanked=S.players.map(p=>{
+          const pm=seasonMatches.filter(m=>m.playerAId===p.id||m.playerBId===p.id);
+          let w=0,d=0,l=0,gf=0,ga=0,cs=0;
+          pm.forEach(m=>{
+            const side=m.playerAId===p.id?'A':'B';
+            const res=getRC(m.scoreA,m.scoreB,side);
+            const myG=side==='A'?m.scoreA:m.scoreB,opG=side==='A'?m.scoreB:m.scoreA;
+            const oppCat=playerCatMap[side==='A'?m.playerBId:m.playerAId]||'Main';
+            const mult=getRatingMultiplier(p.category||'Main',oppCat,res);
+            if(res==='W')w+=mult;else if(res==='D')d++;else l+=mult;
+            gf+=myG;ga+=opG;if(opG===0)cs++;
+          });
+          const rating=Math.max(0,Math.round(w*10+d*5+l*(-5)+(gf-ga)+cs*2));
+          return{id:p.id,rating};
+        }).sort((a,b)=>b.rating-a.rating);
+
+        const mySeasonRank=seasonRanked.findIndex(p=>p.id===S.user.id)+1;
+        if(mySeasonRank>0){
+          const badgeColor=mySeasonRank===1?'badge-star':mySeasonRank===2?'badge-silver':mySeasonRank===3?'badge-gold':mySeasonRank<=10?'badge-blue':'badge-green';
+          const icon=mySeasonRank===1?'★':mySeasonRank===2?'◆':mySeasonRank===3?'◈':'#';
+          seasonRankHtml=`
+            <div style="margin-bottom:16px;background:linear-gradient(135deg,rgba(27,58,107,0.4),rgba(10,22,40,0.9));border:1px solid var(--ucl-border);border-radius:10px;padding:14px 18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+              <div style="font-family:'Bebas Neue',sans-serif;font-size:40px;color:var(--ucl-star);line-height:1">#${mySeasonRank}</div>
+              <div>
+                <div style="font-family:'Bebas Neue',sans-serif;font-size:16px;letter-spacing:2px;color:#82B1FF">${seasonName} RANKING</div>
+                <div style="font-size:12px;color:#4472C4">Your current season standing</div>
+              </div>
+              <span class="player-badge ${badgeColor}" style="margin-left:auto"><span class="badge-icon">${icon}</span>${seasonName} Rank #${mySeasonRank}</span>
+            </div>`;
+        }
+      }
+    }catch(e){console.error(e);}
+
+    // Inject seasonal rank above division guide
+    const divGuideEl=$('divisionGuide');
+    if(divGuideEl&&seasonRankHtml){
+      const wrapper=divGuideEl.parentElement;
+      const existing=$('seasonRankBanner');
+      if(existing)existing.remove();
+      const banner=document.createElement('div');
+      banner.id='seasonRankBanner';
+      banner.innerHTML=seasonRankHtml;
+      wrapper.insertBefore(banner,divGuideEl);
+    }
+
     const divInfo=[
       {d:9,name:'Rookie',     promo:'9 pts in 10 matches',   relo:'No relegation — entry level',      tier:'low'},
       {d:8,name:'Amateur',    promo:'11 pts in 10 matches',  relo:'Relegated if ≤2 pts in cycle',    tier:'low'},
@@ -1179,6 +1238,7 @@ async function loadHome(){
           ${divBadge(di.d)}
           <div class="div-guide-name">${di.name}</div>
         </div>
+        <div style="font-size:10px;font-weight:700;letter-spacing:1px;color:var(--ucl-star);margin:4px 0 2px;text-transform:uppercase">${seasonName}</div>
         <div class="div-guide-pts">&#8679; ${di.promo}</div>
         <div class="div-guide-desc">${di.relo}</div>
         ${di.tier==='top'?'<div class="div-guide-badge" style="color:#F5C518">ELO RATING SYSTEM</div>':''}
@@ -1638,11 +1698,15 @@ async function loadSubmitPage(){
 async function submitMatchResult(){
   if(!S.user)return T('Login required','error');
   const oppId=$('submitOpponent').value;
-  const sA=parseInt($('scoreA').value)||0,sB=parseInt($('scoreB').value)||0;
+  const sA=parseInt($('scoreA').value);
+  const sB=parseInt($('scoreB').value);
   const matchDate=$('matchDate').value;
   if(!oppId)return T('Select an opponent','error');
+  if(isNaN(sA)||isNaN(sB)||$('scoreA').value===''||$('scoreB').value==='')return T('Enter both scores','error');
   const opp=S.players.find(p=>p.id===oppId);
   if(!opp)return T('Opponent not found','error');
+  const btn=document.querySelector('#submitForm .btn-primary');
+  if(btn)btn.disabled=true;
   try{
     await addDoc(collection(db,'matches'),{
       playerAId:S.user.id,playerAName:S.user.name,playerACat:S.user.category||'Main',
@@ -1652,8 +1716,13 @@ async function submitMatchResult(){
     });
     const msg=isHigh(sA,sB)?`GOAL FEST! ${sA+sB} goals submitted. Waiting for ${opp.name}.`:`Result submitted. Waiting for ${opp.name} to confirm.`;
     T(msg,'success');
-    $('scoreA').value='';$('scoreB').value='';S.matches=[];
+    // Reset all fields — force user to re-select opponent
+    $('scoreA').value='';
+    $('scoreB').value='';
+    $('submitOpponent').value='';  // reset to placeholder
+    S.matches=[];
   }catch(e){T('Submit failed: '+e.message,'error');}
+  finally{if(btn)btn.disabled=false;}
 }
 
 // ===== MOD PANEL =====
@@ -1985,7 +2054,7 @@ function renderAdminPlayers(players){
         <div class="pending-meta">Div${p.division||9} - Rating:${getDisplayRating(p)} - ${p.wins||0}W ${p.draws||0}D ${p.losses||0}L - Cycle:${p.cycleMP||0}/10 (${p.cyclePts||0}pts) - ${statusBadge(p.status||'active')}</div>
       </div>
       <div style="display:flex;gap:4px;flex-wrap:wrap">
-        <button class="btn-sm btn-edit" onclick="adminEditPlayer('${p.id}',${p.division||9},'${p.category||'Main'}',${p.wins||0},${p.draws||0},${p.losses||0},${p.goalsFor||0},${p.goalsAgainst||0},${p.cleanSheets||0},${p.cycleMP||0},${p.cyclePts||0},'${p.status||'active'}')">Edit</button>
+        <button class="btn-sm btn-edit" onclick="adminEditPlayer('${p.id}',${p.division||9},'${p.category||'Main'}',${p.wins||0},${p.draws||0},${p.losses||0},${p.goalsFor||0},${p.goalsAgainst||0},${p.cleanSheets||0},${p.cycleMP||0},${p.cyclePts||0},'${p.status||'active'}','${(p.name||'').replace(/'/g,"\\'")}')">Edit</button>
         <button class="btn-sm btn-ban" onclick="adminToggleBan('${p.id}','${p.name}','${p.status||'active'}')">
           ${p.status==='banned'?'Unban':'Ban'}</button>
         <button class="btn-sm ${p.isPOTD?'btn-reject':'btn-approve'}" onclick="adminTogglePOTD('${p.id}','${p.name}',${!!p.isPOTD})">${p.isPOTD?'Rem POTD':'POTD'}</button>
@@ -2026,8 +2095,9 @@ async function adminToggleMod(id,name,isMod){
 async function adminApprove(id){await updateDoc(doc(db,'players',id),{status:'active'});T('Player approved','success');loadAdminPanel('pending');}
 async function adminReject(id){if(!confirm('Reject and delete this registration?'))return;await deleteDoc(doc(db,'players',id));T('Rejected','info');loadAdminPanel('pending');}
 
-function adminEditPlayer(id,div,cat,wins,draws,losses,gf,ga,cs,cmp,cpts,status){
-  $('editPlayerId').value=id;$('editDivision').value=div;$('editCategory').value=cat;
+function adminEditPlayer(id,div,cat,wins,draws,losses,gf,ga,cs,cmp,cpts,status,name){
+  $('editPlayerId').value=id;$('editPlayerName').value=name||'';
+  $('editDivision').value=div;$('editCategory').value=cat;
   $('editWins').value=wins;$('editDraws').value=draws;$('editLosses').value=losses;
   $('editGF').value=gf;$('editGA').value=ga;$('editCS').value=cs;
   $('editCycleMP').value=cmp;$('editCyclePts').value=cpts;$('editStatus').value=status;
@@ -2037,6 +2107,7 @@ function adminEditPlayer(id,div,cat,wins,draws,losses,gf,ga,cs,cmp,cpts,status){
 
 async function savePlayerEdit(){
   const id=$('editPlayerId').value,div=parseInt($('editDivision').value);
+  const newName=($('editPlayerName').value||'').trim();
   const cat=$('editCategory').value;
   const wins=parseInt($('editWins').value),draws=parseInt($('editDraws').value),losses=parseInt($('editLosses').value);
   const gf=parseInt($('editGF').value),ga=parseInt($('editGA').value),cs=parseInt($('editCS').value);
@@ -2044,12 +2115,19 @@ async function savePlayerEdit(){
   const status=$('editStatus').value;
   const newPw=($('editPlayerPw').value||'').trim();
   if(div<1||div>9)return T('Division 1-9 only','error');
+  if(!newName)return T('Player name cannot be empty','error');
   if(newPw&&newPw.length<4)return T('Password must be at least 4 characters','error');
   try{
-    const updates={division:div,category:cat,wins,draws,losses,goalsFor:gf,goalsAgainst:ga,cleanSheets:cs,cycleMP:cmp,cyclePts:cpts,status};
-    if(newPw) updates.password=newPw;
+    // Check if name already taken by another player
+    if(newName){
+      const existing=await getDocs(query(collection(db,'players'),where('name','==',newName)));
+      const conflict=existing.docs.find(d=>d.id!==id);
+      if(conflict)return T('Name "'+newName+'" is already taken','error');
+    }
+    const updates={name:newName,division:div,category:cat,wins,draws,losses,goalsFor:gf,goalsAgainst:ga,cleanSheets:cs,cycleMP:cmp,cyclePts:cpts,status};
+    if(newPw)updates.password=newPw;
     await updateDoc(doc(db,'players',id),updates);
-    T('Player updated'+(newPw?' (password changed)':''),'success');
+    T('Player updated'+(newPw?' + password changed':''),'success');
     closeModal('editPlayerModal');loadAdminPanel('players');
   }catch(e){T('Error: '+e.message,'error');}
 }
